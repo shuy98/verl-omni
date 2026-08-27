@@ -219,7 +219,6 @@ class LTX23PipelineWithLogProb(LTX2Pipeline):
         prompt_context: LTXPromptContext | None = None,
     ) -> LTXPhaseResult:
         """Prepare and execute one phase with FlowGRPO SDE transitions."""
-        del phase_recipe
         self._check_forward_inputs(request_inputs, image=image)
         guidance_parallel_ready = self._setup_forward_runtime(req, request_inputs, attention_kwargs)
         device = self.device
@@ -273,6 +272,9 @@ class LTX23PipelineWithLogProb(LTX2Pipeline):
             latent_height,
             latent_width,
             image_conditioned=conditioning_mask is not None,
+            sampler=phase_recipe.sampler,
+            generator=request_inputs.generator,
+            conditioning_mask=conditioning_mask,
         )
         _ = retrieve_timesteps(
             audio_scheduler,
@@ -304,6 +306,7 @@ class LTX23PipelineWithLogProb(LTX2Pipeline):
             original_audio_num_frames=original_audio_num_frames,
             padded_audio_num_frames=padded_audio_num_frames,
             timesteps=timesteps_tensor,
+            sampler=phase_recipe.sampler,
             audio_scheduler=audio_scheduler,
             video_audio_step_adapter=video_audio_step_adapter,
         )

@@ -8,13 +8,13 @@ ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit}
 source $ASCEND_HOME_PATH/set_env.sh
 source $ASCEND_HOME_PATH/../nnal/atb/set_env.sh
 
-WORKSPACE=${WORKSPACE:-$HOME}
-MODEL_PATH=${MODEL_PATH:-dg845/LTX-2.3-Diffusers}
+WORKSPACE=${WORKSPACE:-/workspace/src/verl-omni}
+MODEL_PATH=${MODEL_PATH:-/home/y00609984/huggingface_models/LTX-2.3-Diffusers}
 DATA_DIR=${DATA_DIR:-$WORKSPACE/data/vid_prompt/verl_omni}
-CLAP_MODEL_PATH=${CLAP_MODEL_PATH:-laion/larger_clap_general}
-IMAGEBIND_MODEL_PATH=${IMAGEBIND_MODEL_PATH:-.checkpoints/imagebind_huge.pth}
-NUM_GPUS=${NUM_GPUS:-16}
-ROLLOUT_TP=${ROLLOUT_TP:-4}
+CLAP_MODEL_PATH=${CLAP_MODEL_PATH:-/home/y00609984/huggingface_models/larger_clap_general}
+IMAGEBIND_MODEL_PATH=${IMAGEBIND_MODEL_PATH:-/home/y00609984/huggingface_models/imagebind/imagebind_huge.pth}
+NUM_GPUS=${NUM_GPUS:-8}
+ROLLOUT_TP=${ROLLOUT_TP:-8}
 REWARD_DEVICE=${REWARD_DEVICE:-npu}
 REWARD_NUM_WORKERS=${REWARD_NUM_WORKERS:-1}
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-100}
@@ -47,8 +47,8 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.device=npu \
     data.train_files=$train_path \
     data.val_files=$test_path \
-    data.train_batch_size=32 \
-    data.val_max_samples=1024 \
+    data.train_batch_size=1 \
+    data.val_max_samples=1 \
     data.max_prompt_length=1024 \
     data.truncation=error \
     data.seed=42 \
@@ -62,21 +62,23 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.model.lora_alpha=128 \
     actor_rollout_ref.model.target_modules="$ltx_lora_targets" \
     actor_rollout_ref.model.fsdp_layer_prefixes="['transformer_blocks.']" \
-    actor_rollout_ref.actor.strategy=fsdp \
+    actor_rollout_ref.actor.strategy=fsdp2 \
     '+actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=[LTX2VideoTransformerBlock]' \
     actor_rollout_ref.actor.optim.lr=3e-4 \
     actor_rollout_ref.actor.optim.weight_decay=1e-4 \
     actor_rollout_ref.actor.optim.betas="[0.9,0.999]" \
     actor_rollout_ref.actor.optim.override_optimizer_config="{eps: 1e-8}" \
     actor_rollout_ref.actor.optim.clip_grad=1.0 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=1 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.diffusion_loss.clip_ratio=1e-4 \
     actor_rollout_ref.actor.diffusion_loss.adv_clip_max=5.0 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=$NUM_GPUS \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.offload_policy=True \
     actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm_omni \
     actor_rollout_ref.rollout.rollout_attn_backend=TORCH_SDPA \
@@ -87,7 +89,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.agent.default_agent_loop=ltx2_diffusion_single_turn_agent \
     actor_rollout_ref.rollout.load_format=safetensors \
     actor_rollout_ref.rollout.layered_summon=True \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.pipeline.height=256 \
     actor_rollout_ref.rollout.pipeline.width=384 \
     actor_rollout_ref.rollout.pipeline.num_frames=81 \
@@ -111,7 +113,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.val_kwargs.pipeline.guidance_scale=4.0 \
     +actor_rollout_ref.rollout.val_kwargs.pipeline.output_type=pt \
     actor_rollout_ref.rollout.val_kwargs.algo.noise_level=0.0 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     reward.num_workers=$REWARD_NUM_WORKERS \
     reward.reward_model.enable=False \
     reward.custom_reward_function.path=pkg://verl_omni.reward_loop.reward_manager.multi \
@@ -130,7 +132,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     "+reward.reward_functions.imagebind.model_name_or_path=$IMAGEBIND_MODEL_PATH" \
     '+reward.reward_functions.imagebind.mode=audio_video' \
     reward.aggregation=weighted_sum \
-    trainer.logger='["console","tensorboard","wandb"]' \
+    trainer.logger='["console"]' \
     trainer.project_name=flow_grpo_npu \
     trainer.experiment_name=ltx2_3_t2av_lora_npu \
     trainer.default_local_dir=$checkpoint_dir \
