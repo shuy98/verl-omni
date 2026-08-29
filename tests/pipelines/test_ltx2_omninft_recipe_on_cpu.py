@@ -16,6 +16,7 @@
 import asyncio
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -35,20 +36,29 @@ def test_recipe_freezes_omninft_direct_preference_contract():
     recipe = RECIPE.read_text(encoding="utf-8")
     required = (
         "python3 -m verl_omni.trainer.main_diffusion",
-        "data.custom_cls.name=OmniNFTPromptDataset",
-        "data.custom_cls.collate_fn=collate_omni_nft_prompt_groups",
+        "DATA_DIR=",
+        "train.parquet",
+        "test.parquet",
         "algorithm.trainer_type=direct_preference",
         "algorithm.sample_source=online",
         "algorithm.paired_preference=false",
         "actor_rollout_ref.model.algorithm=omni_nft",
         "actor_rollout_ref.model.model_type=omni_nft_model",
+        "actor_rollout_ref.actor.strategy=fsdp2",
         "actor_rollout_ref.actor.diffusion_loss.loss_mode=omni_nft",
+        "actor_rollout_ref.actor.diffusion_loss.video_weight=1.0",
+        "actor_rollout_ref.actor.diffusion_loss.audio_weight=1.0",
+        "actor_rollout_ref.actor.fsdp_config.ulysses_sequence_parallel_size=1",
         "actor_rollout_ref.rollout.n=8",
         "actor_rollout_ref.rollout.calculate_log_probs=False",
         "actor_rollout_ref.rollout.rollout_adapter=old",
         "actor_rollout_ref.rollout.agent.default_agent_loop=ltx2_omni_nft_single_turn_agent",
     )
-    forbidden = ("calculate_log_probs=True", "algorithm=diffusion_nft", "rollout.algo.sde_")
+    forbidden = (
+        "calculate_log_probs=True",
+        "algorithm=diffusion_nft",
+        "rollout.algo.sde_",
+    )
 
     assert all(setting in recipe for setting in required)
     assert all(setting not in recipe for setting in forbidden)
@@ -101,11 +111,90 @@ def test_omninft_worker_rejects_duplicate_sample_uid(monkeypatch):
         asyncio.run(worker.generate_sequences(batch))
 
 
-def test_recipe_full_training_fails_before_runtime_initialization():
-    result = subprocess.run([str(RECIPE)], cwd=REPO_ROOT, capture_output=True, text=True)
+def test_omninft_worker_stubs_all_rewards_to_zero():
+    from verl_omni.pipelines.ltx2_omni_nft.agent_loop import LTX2OmniNFTAgentLoopWorker
 
-    assert result.returncode == 2
-    assert "OmniNFT training prerequisites missing:" in result.stderr
-    assert "rollout adapter (stage 2)" not in result.stderr
-    assert "training adapter (stage 3)" in result.stderr
-    assert "omni_nft loss (stage 5)" in result.stderr
+    output = SimpleNamespace(reward_score=123.0)
+    worker = object.__new__(LTX2OmniNFTAgentLoopWorker)
+
+    asyncio.run(worker._compute_score(output, prompts=None, responses=None, kwargs={}, validate=True))
+
+    assert output.reward_score == 0.0
+
+
+def test_recipe_training_prerequisites_are_registered():
+    from verl_omni.pipelines.ltx2_flow_grpo.diffusers_training_adapter import LTX23FlowGRPO
+    from verl_omni.pipelines.model_base import DiffusionModelBase, VllmOmniPipelineBase
+    from verl_omni.trainer.diffusion.diffusion_algos import OmniNFTLoss, get_diffusion_loss_fn
+
+    training_adapter = DiffusionModelBase.get_class_by_name("LTX2Pipeline", "omni_nft")
+    rollout_adapter = VllmOmniPipelineBase.get_class("LTX2Pipeline", "omni_nft")
+
+    assert training_adapter.__name__ == "LTX23OmniNFT"
+    assert issubclass(training_adapter, DiffusionModelBase)
+    assert not issubclass(training_adapter, LTX23FlowGRPO)
+    assert rollout_adapter is not None
+    assert isinstance(get_diffusion_loss_fn("omni_nft"), OmniNFTLoss)
+
+
+def test_omninft_training_adapter_builds_one_shot_joint_av_inputs():
+    from tensordict import TensorDict
+
+    from verl_omni.pipelines.ltx2_omni_nft.diffusers_training_adapter import LTX23OmniNFT
+
+    batch_size = 2
+    micro_batch = TensorDict(
+        {
+            "audio_prompt_embeds": torch.randn(batch_size, 6, 4),
+            "video_seq_len": torch.full((batch_size,), 5),
+        },
+        batch_size=batch_size,
+    )
+    model_config = SimpleNamespace(
+        pipeline=SimpleNamespace(
+            num_frames=81,
+            height=256,
+            width=384,
+            frame_rate=24.0,
+            guidance_scale=1.0,
+        )
+    )
+    latents = torch.randn(batch_size, 8, 4)
+    timesteps = torch.tensor([900.0, 500.0])
+    prompt_embeds = torch.randn(batch_size, 6, 4)
+    prompt_mask = torch.ones(batch_size, 6)
+
+    inputs, negative_inputs = LTX23OmniNFT.prepare_model_inputs(
+        module=None,
+        model_config=model_config,
+        latents=latents,
+        timesteps=timesteps,
+        prompt_embeds=prompt_embeds,
+        prompt_embeds_mask=prompt_mask,
+        negative_prompt_embeds=None,
+        negative_prompt_embeds_mask=None,
+        micro_batch=micro_batch,
+        step=3,
+    )
+
+    torch.testing.assert_close(inputs["hidden_states"], latents[:, :5])
+    torch.testing.assert_close(inputs["audio_hidden_states"], latents[:, 5:])
+    torch.testing.assert_close(inputs["timestep"], timesteps)
+    assert negative_inputs is None
+
+
+def test_omninft_training_adapter_rejects_reverse_transition_api():
+    from verl_omni.pipelines.ltx2_omni_nft.diffusers_training_adapter import LTX23OmniNFT
+
+    with pytest.raises(NotImplementedError, match="does not sample reverse transitions"):
+        LTX23OmniNFT.forward_and_sample_previous_step(None, None, None, {}, None, None, 0)
+
+
+def test_omninft_engine_rejects_non_fsdp2_and_context_parallelism():
+    from verl_omni.workers.engine.fsdp.diffusers_impl import _validate_omni_nft_fsdp2_config
+
+    _validate_omni_nft_fsdp2_config(SimpleNamespace(strategy="fsdp2", ulysses_sequence_parallel_size=1))
+    with pytest.raises(NotImplementedError, match="only actor.strategy=fsdp2"):
+        _validate_omni_nft_fsdp2_config(SimpleNamespace(strategy="fsdp", ulysses_sequence_parallel_size=1))
+    with pytest.raises(NotImplementedError, match="does not implement Ulysses/context parallelism"):
+        _validate_omni_nft_fsdp2_config(SimpleNamespace(strategy="fsdp2", ulysses_sequence_parallel_size=2))

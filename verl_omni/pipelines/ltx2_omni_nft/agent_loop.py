@@ -41,12 +41,17 @@ def _ensure_omni_nft_sample_uids(batch: DataProto) -> None:
 
 
 class LTX2OmniNFTAgentLoopWorker(DiffusionAgentLoopWorker):
-    """Assign unique per-rollout identities around the shared worker."""
+    """Assign rollout identities and provide the temporary zero-reward stub."""
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Assign per-rollout identities before dispatching repeated prompt groups."""
         _ensure_omni_nft_sample_uids(batch)
         return await super().generate_sequences(batch)
+
+    async def _compute_score(self, output, prompts, responses, kwargs, validate: bool = False):
+        """Return a neutral placeholder until AV component reward scoring is implemented."""
+        del prompts, responses, kwargs, validate
+        output.reward_score = 0.0
 
 
 @register("ltx2_omni_nft_single_turn_agent")

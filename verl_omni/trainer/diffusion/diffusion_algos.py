@@ -1010,6 +1010,200 @@ class DiffusionNFTLoss(DiffusionLossFn):
         return batch
 
 
+@register_diffusion_loss("omni_nft")
+class OmniNFTLoss(DiffusionNFTLoss):
+    """Two-branch DiffusionNFT objective for joint audio-video generation."""
+
+    required_model_output_keys = (
+        "video_forward_prediction",
+        "video_old_prediction",
+        "video_ref_forward_prediction",
+        "video_x0",
+        "video_xt",
+        "video_t_expanded",
+        "audio_forward_prediction",
+        "audio_old_prediction",
+        "audio_ref_forward_prediction",
+        "audio_x0",
+        "audio_xt",
+        "audio_t_expanded",
+    )
+    required_data_keys = ("video_reward_prob", "audio_reward_prob")
+
+    @staticmethod
+    def _compute_modality_loss(
+        *,
+        forward_prediction: torch.Tensor,
+        old_prediction: torch.Tensor,
+        ref_forward_prediction: torch.Tensor,
+        x0: torch.Tensor,
+        xt: torch.Tensor,
+        t_expanded: torch.Tensor,
+        reward_prob: torch.Tensor,
+        config: DiffusionActorConfig,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        loss_cfg = config.diffusion_loss
+        beta = loss_cfg.mix_beta
+        old_prediction = old_prediction.detach()
+        ref_forward_prediction = ref_forward_prediction.detach()
+
+        reward_weight = reward_prob
+        if reward_weight.ndim > 1:
+            reward_weight = reward_weight.flatten(1).mean(dim=1)
+        reward_weight = reward_weight.to(device=x0.device, dtype=x0.dtype)
+
+        reduce_dims = tuple(range(1, x0.ndim))
+        positive_prediction = beta * forward_prediction + (1.0 - beta) * old_prediction
+        negative_prediction = (1.0 + beta) * old_prediction - beta * forward_prediction
+        positive_x0 = xt - t_expanded * positive_prediction
+        negative_x0 = xt - t_expanded * negative_prediction
+
+        with torch.no_grad():
+            positive_weight = (
+                torch.abs(positive_x0.double() - x0.double())
+                .mean(dim=reduce_dims, keepdim=True)
+                .clamp_min(loss_cfg.adaptive_weight_min)
+                .to(dtype=positive_x0.dtype)
+            )
+            negative_weight = (
+                torch.abs(negative_x0.double() - x0.double())
+                .mean(dim=reduce_dims, keepdim=True)
+                .clamp_min(loss_cfg.adaptive_weight_min)
+                .to(dtype=negative_x0.dtype)
+            )
+
+        positive_loss = ((positive_x0 - x0).square() / positive_weight).mean(dim=reduce_dims)
+        negative_loss = ((negative_x0 - x0).square() / negative_weight).mean(dim=reduce_dims)
+        policy_per_sample = reward_weight * positive_loss / beta + (1.0 - reward_weight) * negative_loss / beta
+        policy_loss = (policy_per_sample * loss_cfg.adv_clip_max).mean()
+        ref_loss = (forward_prediction - ref_forward_prediction).square().mean()
+        details = {
+            "positive_loss": positive_loss.mean(),
+            "negative_loss": negative_loss.mean(),
+            "ref_kl_loss": ref_loss,
+            "old_deviate": (forward_prediction - old_prediction).square().mean(),
+            "reward_prob_mean": reward_weight.mean(),
+        }
+        return policy_loss, ref_loss, details
+
+    @classmethod
+    def compute_loss(
+        cls,
+        *,
+        video_forward_prediction: torch.Tensor,
+        video_old_prediction: torch.Tensor,
+        video_ref_forward_prediction: torch.Tensor,
+        video_x0: torch.Tensor,
+        video_xt: torch.Tensor,
+        video_t_expanded: torch.Tensor,
+        video_reward_prob: torch.Tensor,
+        audio_forward_prediction: torch.Tensor,
+        audio_old_prediction: torch.Tensor,
+        audio_ref_forward_prediction: torch.Tensor,
+        audio_x0: torch.Tensor,
+        audio_xt: torch.Tensor,
+        audio_t_expanded: torch.Tensor,
+        audio_reward_prob: torch.Tensor,
+        config: DiffusionActorConfig,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        video_policy, video_ref, video_details = cls._compute_modality_loss(
+            forward_prediction=video_forward_prediction,
+            old_prediction=video_old_prediction,
+            ref_forward_prediction=video_ref_forward_prediction,
+            x0=video_x0,
+            xt=video_xt,
+            t_expanded=video_t_expanded,
+            reward_prob=video_reward_prob,
+            config=config,
+        )
+        audio_policy, audio_ref, audio_details = cls._compute_modality_loss(
+            forward_prediction=audio_forward_prediction,
+            old_prediction=audio_old_prediction,
+            ref_forward_prediction=audio_ref_forward_prediction,
+            x0=audio_x0,
+            xt=audio_xt,
+            t_expanded=audio_t_expanded,
+            reward_prob=audio_reward_prob,
+            config=config,
+        )
+        loss_cfg = config.diffusion_loss
+        total_loss = (
+            loss_cfg.video_weight * video_policy
+            + loss_cfg.audio_weight * audio_policy
+            + loss_cfg.video_ref_kl_coef * video_ref
+            + loss_cfg.audio_ref_kl_coef * audio_ref
+        )
+
+        metrics = {
+            "actor/video/policy_loss": video_policy.detach().item(),
+            "actor/audio/policy_loss": audio_policy.detach().item(),
+            "actor/total_loss": total_loss.detach().item(),
+        }
+        for modality, details in (("video", video_details), ("audio", audio_details)):
+            for name, value in details.items():
+                metrics[f"actor/{modality}/{name}"] = value.detach().item()
+        return total_loss, metrics
+
+    def __call__(
+        self,
+        *,
+        config: DiffusionActorConfig,
+        model_output: dict[str, Any],
+        data: TensorDict,
+    ) -> DiffusionLossResult:
+        loss, metrics = self.compute_loss(
+            **{key: model_output[key] for key in self.required_model_output_keys},
+            video_reward_prob=data["video_reward_prob"],
+            audio_reward_prob=data["audio_reward_prob"],
+            config=config,
+        )
+        return DiffusionLossResult(loss=loss, metrics=metrics)
+
+    @staticmethod
+    def prepare_actor_batch(batch: DataProto, reward_tensor: torch.Tensor, config: Any) -> DataProto:
+        """Build equal video/audio probabilities until component reward routing is implemented."""
+        if "uid" not in batch.non_tensor_batch:
+            raise ValueError("OmniNFT actor batch requires `uid` in non_tensor_batch.")
+        for key in ("video_latents_clean", "audio_latents_clean", "train_timesteps"):
+            if key not in batch.batch:
+                raise ValueError(f"OmniNFT actor batch requires `{key}` from rollout.")
+
+        scalar_rewards = reward_tensor.detach().float()
+        if scalar_rewards.ndim > 1:
+            scalar_rewards = scalar_rewards.flatten(1).mean(dim=1)
+        algorithm_cfg = config.algorithm
+        actor_cfg = config.actor_rollout_ref.actor
+        advantages = DiffusionNFTLoss._compute_group_advantages(
+            rewards=scalar_rewards,
+            uid=batch.non_tensor_batch["uid"],
+            norm_by_std=algorithm_cfg.norm_adv_by_std_in_grpo,
+            global_std=algorithm_cfg.global_std,
+        )
+        reward_prob = DiffusionNFTLoss._advantage_to_reward_prob(
+            advantages,
+            adv_clip_max=actor_cfg.diffusion_loss.adv_clip_max,
+            adv_mode=algorithm_cfg.adv_mode,
+        )
+        train_timesteps = DiffusionNFTLoss._select_train_timesteps(
+            batch.batch["train_timesteps"],
+            timestep_fraction=algorithm_cfg.timestep_fraction,
+            seed=actor_cfg.data_loader_seed,
+        )
+        num_steps = train_timesteps.shape[1]
+        timestep_advantages = advantages[:, None].expand(-1, num_steps)
+        timestep_prob = reward_prob[:, None].expand(-1, num_steps)
+
+        batch.batch["train_timesteps"] = train_timesteps
+        batch.batch["advantages"] = timestep_advantages
+        batch.batch["returns"] = timestep_advantages
+        batch.batch["reward_prob"] = timestep_prob
+        batch.batch["video_reward_prob"] = timestep_prob
+        batch.batch["audio_reward_prob"] = timestep_prob
+        batch.batch["modality_reward_probs"] = torch.stack((timestep_prob, timestep_prob), dim=-1)
+        batch.batch["sample_level_rewards"] = scalar_rewards[:, None].expand(-1, num_steps)
+        return batch
+
+
 @register_diffusion_loss("kl")
 class KLLoss(DiffusionLossFn):
     """KL divergence between current and reference reverse-SDE means."""

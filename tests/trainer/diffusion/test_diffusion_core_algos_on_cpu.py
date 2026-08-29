@@ -448,6 +448,107 @@ def test_compute_policy_loss_diffusion_nft() -> None:
         assert key in metrics, key
 
 
+def test_prepare_omni_nft_actor_batch_with_zero_reward_stub() -> None:
+    from types import SimpleNamespace
+
+    from verl import DataProto
+
+    batch_size, steps = 4, 6
+    batch = DataProto.from_dict(
+        tensors={
+            "video_latents_clean": torch.randn(batch_size, 12, 8),
+            "audio_latents_clean": torch.randn(batch_size, 5, 8),
+            "train_timesteps": torch.arange(steps).expand(batch_size, -1),
+        },
+        non_tensors={"uid": np.array(["p0", "p0", "p1", "p1"], dtype=object)},
+    )
+    config = SimpleNamespace(
+        algorithm=SimpleNamespace(
+            norm_adv_by_std_in_grpo=True,
+            global_std=True,
+            adv_mode="continuous",
+            timestep_fraction=0.5,
+        ),
+        actor_rollout_ref=SimpleNamespace(
+            actor=SimpleNamespace(
+                diffusion_loss=SimpleNamespace(adv_clip_max=5.0),
+                data_loader_seed=42,
+            )
+        ),
+    )
+
+    result = diffusion_algos.OmniNFTLoss.prepare_actor_batch(batch, torch.zeros(batch_size), config)
+
+    assert result.batch["train_timesteps"].shape == (batch_size, 3)
+    assert result.batch["video_reward_prob"].shape == (batch_size, 3)
+    assert result.batch["audio_reward_prob"].shape == (batch_size, 3)
+    assert result.batch["modality_reward_probs"].shape == (batch_size, 3, 2)
+    torch.testing.assert_close(result.batch["video_reward_prob"], torch.full((batch_size, 3), 0.5))
+    torch.testing.assert_close(result.batch["audio_reward_prob"], torch.full((batch_size, 3), 0.5))
+
+
+def test_compute_omni_nft_joint_av_loss_backpropagates_both_modalities() -> None:
+    from hydra import compose, initialize_config_dir
+    from verl.utils.config import omega_conf_to_dataclass
+
+    from verl_omni.workers.config.diffusion.actor import FSDPDiffusionActorConfig
+
+    batch_size = 2
+    video_x0 = torch.randn(batch_size, 7, 4)
+    audio_x0 = torch.randn(batch_size, 3, 4)
+    video_forward = torch.randn_like(video_x0, requires_grad=True)
+    audio_forward = torch.randn_like(audio_x0, requires_grad=True)
+    with initialize_config_dir(
+        config_dir=os.path.abspath("verl_omni/trainer/config/diffusion/actor"), version_base=None
+    ):
+        cfg = compose(
+            config_name="dp_diffusion_actor",
+            overrides=[
+                "strategy=fsdp2",
+                "diffusion_loss.loss_mode=omni_nft",
+                "diffusion_loss.video_weight=2.0",
+                "diffusion_loss.audio_weight=3.0",
+                "diffusion_loss.video_ref_kl_coef=0.1",
+                "diffusion_loss.audio_ref_kl_coef=0.2",
+                "ppo_micro_batch_size_per_gpu=2",
+            ],
+        )
+    actor_config: FSDPDiffusionActorConfig = omega_conf_to_dataclass(cfg)
+
+    loss, metrics = diffusion_algos.OmniNFTLoss.compute_loss(
+        video_forward_prediction=video_forward,
+        video_old_prediction=torch.randn_like(video_x0),
+        video_ref_forward_prediction=torch.randn_like(video_x0),
+        video_x0=video_x0,
+        video_xt=torch.randn_like(video_x0),
+        video_t_expanded=torch.full((batch_size, 1, 1), 0.5),
+        video_reward_prob=torch.full((batch_size,), 0.5),
+        audio_forward_prediction=audio_forward,
+        audio_old_prediction=torch.randn_like(audio_x0),
+        audio_ref_forward_prediction=torch.randn_like(audio_x0),
+        audio_x0=audio_x0,
+        audio_xt=torch.randn_like(audio_x0),
+        audio_t_expanded=torch.full((batch_size, 1, 1), 0.5),
+        audio_reward_prob=torch.full((batch_size,), 0.5),
+        config=actor_config,
+    )
+    loss.backward()
+
+    assert loss.shape == ()
+    assert video_forward.grad is not None and torch.isfinite(video_forward.grad).all()
+    assert audio_forward.grad is not None and torch.isfinite(audio_forward.grad).all()
+    assert video_forward.grad.abs().sum() > 0
+    assert audio_forward.grad.abs().sum() > 0
+    for key in (
+        "actor/video/policy_loss",
+        "actor/audio/policy_loss",
+        "actor/video/ref_kl_loss",
+        "actor/audio/ref_kl_loss",
+        "actor/total_loss",
+    ):
+        assert key in metrics
+
+
 def test_compute_policy_loss_grpo_guard() -> None:
     from hydra import compose, initialize_config_dir
     from verl.utils.config import omega_conf_to_dataclass
